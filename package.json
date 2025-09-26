@@ -6,6 +6,6 @@
   "type": "module",
   "engines": { "node": "22.x" },
   "dependencies": {
-    "xlsx": "^0.20.3"
-  }
+  "xlsx": "^0.18.5"
+}
 }

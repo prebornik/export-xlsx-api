@@ -1,0 +1,11 @@
+{
+  "name": "export-xlsx-api",
+  "version": "1.0.0",
+  "license": "MIT",
+  "private": false,
+  "type": "module",
+  "engines": { "node": "22.x" },
+  "dependencies": {
+    "xlsx": "^0.20.3"
+  }
+}

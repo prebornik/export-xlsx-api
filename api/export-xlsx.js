@@ -1,75 +1,88 @@
 // api/export-xlsx.js
-// Vercel serverless funkce: POST -> vrátí XLSX jako attachment
-// Kompatibilní s application/json i application/x-www-form-urlencoded (form POST)
+// POST -> vrátí XLSX jako attachment
+// Vstup: { rows: Array<Array<any>>, sheetName?: string, filename?: string }
+// Podporuje application/json i application/x-www-form-urlencoded
 
-const XLSX = require('xlsx');
+import { utils, write } from 'xlsx';
 
-async function getRawBody(req){
-  return new Promise((resolve, reject) => {
-    let data = '';
-    req.on('data', chunk => data += chunk);
-    req.on('end', () => resolve(data));
-    req.on('error', reject);
-  });
-}
+/** Pomocná funkce: parse application/x-www-form-urlencoded do objektu */
+async function parseFormUrlEncoded(request) {
+  const text = await request.text();
+  const params = new URLSearchParams(text);
+  const payload = params.get('payload');
 
-function parseBody(req, raw){
-  const ct = (req.headers['content-type'] || '').toLowerCase();
-  try {
-    if (ct.startsWith('application/json')) {
-      return JSON.parse(raw || '{}');
-    }
-    if (ct.startsWith('application/x-www-form-urlencoded')) {
-      const params = new URLSearchParams(raw || '');
-      const payload = params.get('payload');
-      if (payload) {
-        try { return JSON.parse(payload); } catch(_) { return { payload }; }
-      }
-      // nebo mapovat všechny klíče
-      const obj = {};
-      for (const [k,v] of params.entries()) obj[k] = v;
-      return obj;
-    }
-    // fallback: zkusit JSON
-    return raw ? JSON.parse(raw) : {};
-  } catch(e) {
-    return {};
-  }
-}
-
-module.exports = async (req, res) => {
-  if (req.method !== 'POST') {
-    res.setHeader('Allow', 'POST');
-    return res.status(405).send('Method Not Allowed');
+  // 1) Pokud přijde payload jako JSON string (časté u formulářů), zkus ho rozparsovat
+  if (payload) {
+    try { return JSON.parse(payload); } catch { return { payload }; }
   }
 
-  try {
-    const raw = await getRawBody(req);
-    const body = parseBody(req, raw);
-    const { rows, sheetName = 'Výsledky', filename = 'vysledky.xlsx' } = body || {};
+  // 2) Jinak převedeme všechny páry na objekt
+  const obj = Object.fromEntries(params.entries());
 
-    if (!Array.isArray(rows) || rows.length === 0) {
-      return res.status(400).json({ error: 'Invalid rows' });
+  // Pokud je rows stringem, zkusíme ho rozparsovat jako JSON
+  if (typeof obj.rows === 'string') {
+    try { obj.rows = JSON.parse(obj.rows); } catch { /* noop */ }
+  }
+
+  return obj;
+}
+
+export async function POST(request) {
+  try {
+    // --- 1) Parsování vstupu -----------------------------------------------
+    const ctype = (request.headers.get('content-type') || '').toLowerCase();
+    let body = {};
+    if (ctype.startsWith('application/json')) {
+      body = await request.json();
+    } else if (ctype.startsWith('application/x-www-form-urlencoded')) {
+      body = await parseFormUrlEncoded(request);
+    } else {
+      // fallback: pokus o JSON
+      try { body = await request.json(); } catch { body = {}; }
     }
 
-    const wb = XLSX.utils.book_new();
-    const ws = XLSX.utils.aoa_to_sheet(rows);
+    const {
+      rows,
+      sheetName = 'Výsledky',
+      filename = 'vysledky.xlsx'
+    } = body || {};
 
-    // Fixace hlavičky a přiměřené šířky sloupců
-    ws['!freeze'] = { xSplit: 0, ySplit: 1 };
-    ws['!cols'] = rows[0].map(h => ({ wch: Math.max(10, String(h || '').length + 2) }));
+    // --- 2) Validace -------------------------------------------------------
+    if (!Array.isArray(rows) || rows.length === 0 || !Array.isArray(rows[0])) {
+      return Response.json(
+        { error: 'Body musí obsahovat { rows: Array<Array<any>> } s minimálně jedním řádkem hlavičky.' },
+        { status: 400 }
+      );
+    }
 
-    XLSX.utils.book_append_sheet(wb, ws, String(sheetName).substring(0,31));
+    // --- 3) Tvorba XLSX ----------------------------------------------------
+    const wb = utils.book_new();
+    const ws = utils.aoa_to_sheet(rows);
 
-    const buf = XLSX.write(wb, { bookType: 'xlsx', type: 'buffer' });
+    // Šířky sloupců dle délky hlaviček (min 10 znaků)
+    ws['!cols'] = rows[0].map(h => ({ wch: Math.max(10, String(h ?? '').length + 2) }));
 
-    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-    res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(filename)}"`);
-    res.setHeader('Cache-Control', 'no-store');
+    // Zapnout filtr v hlavičce (nad celým rozsahem)
+    if (ws['!ref']) ws['!autofilter'] = { ref: ws['!ref'] };
 
-    return res.status(200).send(buf);
+    // POZN.: Freeze panes (zamrznutí horního řádku) není v CE SheetJS podporováno.
+
+    utils.book_append_sheet(wb, ws, String(sheetName).substring(0, 31));
+
+    // Zápis do binárního bufferu
+    const buf = write(wb, { bookType: 'xlsx', type: 'buffer' });
+
+    // --- 4) Odpověď jako download -----------------------------------------
+    // Bezpečný Content-Disposition pro diakritiku: ASCII fallback + RFC 5987 filename*
+    const ascii = String(filename).replace(/[^A-Za-z0-9_.-]/g, '_');
+    const headers = {
+      'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      'Content-Disposition': `attachment; filename="${ascii}"; filename*=UTF-8''${encodeURIComponent(filename)}"`,
+      'Cache-Control': 'no-store'
+    };
+
+    return new Response(buf, { status: 200, headers });
   } catch (err) {
-    console.error(err);
-    return res.status(500).json({ error: 'Export failed' });
+    return Response.json({ error: 'Export failed', detail: String(err?.message || err) }, { status: 500 });
   }
-};
+}
